@@ -1,0 +1,1957 @@
+/*
+ * SLQB: A slab allocator that focuses on per-CPU scaling, and good performance
+ * with order-0 allocations. Fastpaths emphasis is placed on local allocaiton
+ * and freeing, but with a secondary goal of good remote freeing (freeing on
+ * another CPU from that which allocated).
+ *
+ * Using ideas and code from mm/slab.c, mm/slob.c, and mm/slub.c.
+ */
+
+#include <linux/mm.h>
+#include <linux/swap.h> /* struct reclaim_state */
+#include <linux/module.h>
+#include <linux/interrupt.h>
+#include <linux/slab.h>
+#include <linux/seq_file.h>
+#include <linux/cpu.h>
+#include <linux/cpuset.h>
+#include <linux/mempolicy.h>
+#include <linux/ctype.h>
+#include <linux/kallsyms.h>
+#include <linux/memory.h>
+#include <linux/fault-inject.h>
+
+/*
+ * TODO
+ * - fix up releasing of offlined data structures. Not a big deal because
+ *   they don't get cumulatively leaked with successive online/offline cycles
+ * - allow OOM conditions to flush back per-CPU pages to common lists to be
+ *   reused by other CPUs.
+ * - investiage performance with memoryless nodes. Perhaps CPUs can be given
+ *   a default closest home node via which it can use fastpath functions.
+ *   Perhaps it is not a big problem.
+ */
+
+/*
+ * slqb_page overloads struct page, and is used to manage some slob allocation
+ * aspects, however to avoid the horrible mess in include/linux/mm_types.h,
+ * we'll just define our own struct slqb_page type variant here.
+ */
+struct slqb_page {
+	union {
+		struct {
+			unsigned long	flags;		/* mandatory */
+			atomic_t	_count;		/* mandatory */
+			unsigned int	inuse;		/* Nr of objects */
+			struct kmem_cache_list *list;	/* Pointer to list */
+			void		 **freelist;	/* LIFO freelist */
+			union {
+				struct list_head lru;	/* misc. list */
+				struct rcu_head rcu_head; /* for rcu freeing */
+			};
+		};
+		struct page page;
+	};
+};
+static inline void struct_slqb_page_wrong_size(void)
+{ BUILD_BUG_ON(sizeof(struct slqb_page) != sizeof(struct page)); }
+
+#define PG_SLQB_BIT (1 << PG_slab)
+
+/*
+ * slqb_min_order: minimum allocation order for slabs
+ */
+static int slqb_min_order;
+
+/*
+ * slqb_min_objects: minimum number of objects per slab. Increasing this
+ * will increase the allocation order for slabs with larger objects
+ */
+static int slqb_min_objects = 1;
+
+#ifdef CONFIG_NUMA
+static inline int slab_numa(struct kmem_cache *s)
+{
+	return s->flags & SLAB_NUMA;
+}
+#else
+static inline int slab_numa(struct kmem_cache *s)
+{
+	return 0;
+}
+#endif
+
+static inline int slab_hiwater(struct kmem_cache *s)
+{
+	return s->hiwater;
+}
+
+static inline int slab_freebatch(struct kmem_cache *s)
+{
+	return s->freebatch;
+}
+
+/*
+ * Lock order:
+ * kmem_cache_node->list_lock
+ *   kmem_cache_remote_free->lock
+ *
+ * Data structures:
+ * SLQB is primarily per-cpu. For each kmem_cache, each CPU has:
+ *
+ * - A LIFO list of node-local objects. Allocation and freeing of node local
+ *   objects goes first to this list.
+ *
+ * - 2 Lists of slab pages, free and partial pages. If an allocation misses
+ *   the object list, it tries from the partial list, then the free list.
+ *   After freeing an object to the object list, if it is over a watermark,
+ *   some objects are freed back to pages. If an allocation misses these lists,
+ *   a new slab page is allocated from the page allocator. If the free list
+ *   reaches a watermark, some of its pages are returned to the page allocator.
+ *
+ * - A remote free queue, where objects freed that did not come from the local
+ *   node are queued to. When this reaches a watermark, the objects are
+ *   flushed.
+ *
+ * - A remotely freed queue, where objects allocated from this CPU are flushed
+ *   to from other CPUs' remote free queues. kmem_cache_remote_free->lock is
+ *   used to protect access to this queue.
+ *
+ *   When the remotely freed queue reaches a watermark, a flag is set to tell
+ *   the owner CPU to check it. The owner CPU will then check the queue on the
+ *   next allocation that misses the object list. It will move all objects from
+ *   this list onto the object list and then allocate one.
+ *
+ *   This system of remote queueing is intended to reduce lock and remote
+ *   cacheline acquisitions, and give a cooling off period for remotely freed
+ *   objects before they are re-allocated.
+ *
+ * node specific allocations from somewhere other than the local node are
+ * handled by a per-node list which is the same as the above per-CPU data
+ * structures except for the following differences:
+ *
+ * - kmem_cache_node->list_lock is used to protect access for multiple CPUs to
+ *   allocate from a given node.
+ *
+ * - There is no remote free queue. Nodes don't free objects, CPUs do.
+ */
+
+static inline void slqb_stat_inc(struct kmem_cache_list *list,
+				enum stat_item si)
+{
+#ifdef CONFIG_SLQB_STATS
+	list->stats[si]++;
+#endif
+}
+
+static inline void slqb_stat_add(struct kmem_cache_list *list,
+				enum stat_item si, unsigned long nr)
+{
+#ifdef CONFIG_SLQB_STATS
+	list->stats[si] += nr;
+#endif
+}
+
+static inline int slqb_page_to_nid(struct slqb_page *page)
+{
+	return page_to_nid(&page->page);
+}
+
+static inline void *slqb_page_address(struct slqb_page *page)
+{
+	return page_address(&page->page);
+}
+
+static inline struct zone *slqb_page_zone(struct slqb_page *page)
+{
+	return page_zone(&page->page);
+}
+
+static inline int virt_to_nid(const void *addr)
+{
+	return page_to_nid(virt_to_page(addr));
+}
+
+static inline struct slqb_page *virt_to_head_slqb_page(const void *addr)
+{
+	struct page *p;
+
+	p = virt_to_head_page(addr);
+	return (struct slqb_page *)p;
+}
+
+static inline void __free_slqb_pages(struct slqb_page *page, unsigned int order,
+					int pages)
+{
+	struct page *p = &page->page;
+
+	reset_page_mapcount(p);
+	p->mapping = NULL;
+	VM_BUG_ON(!(p->flags & PG_SLQB_BIT));
+	p->flags &= ~PG_SLQB_BIT;
+
+	if (current->reclaim_state)
+		current->reclaim_state->reclaimed_slab += pages;
+	__free_pages(p, order);
+}
+
+#ifdef CONFIG_SLQB_DEBUG
+static inline int slab_debug(struct kmem_cache *s)
+{
+	return s->flags &
+			(SLAB_DEBUG_FREE |
+			 SLAB_RED_ZONE |
+			 SLAB_POISON |
+			 SLAB_STORE_USER |
+			 SLAB_TRACE);
+}
+static inline int slab_poison(struct kmem_cache *s)
+{
+	return s->flags & SLAB_POISON;
+}
+#else
+static inline int slab_debug(struct kmem_cache *s)
+{
+	return 0;
+}
+static inline int slab_poison(struct kmem_cache *s)
+{
+	return 0;
+}
+#endif
+
+#define DEBUG_DEFAULT_FLAGS (SLAB_DEBUG_FREE | SLAB_RED_ZONE | \
+				SLAB_POISON | SLAB_STORE_USER)
+
+/* Internal SLQB flags */
+#define __OBJECT_POISON		0x80000000 /* Poison object */
+
+/* Not all arches define cache_line_size */
+#ifndef cache_line_size
+#define cache_line_size()	L1_CACHE_BYTES
+#endif
+
+#ifdef CONFIG_SMP
+static struct notifier_block slab_notifier;
+#endif
+
+/*
+ * slqb_lock protects slab_caches list and serialises hotplug operations.
+ * hotplug operations take lock for write, other operations can hold off
+ * hotplug by taking it for read (or write).
+ */
+static DECLARE_RWSEM(slqb_lock);
+
+/*
+ * A list of all slab caches on the system
+ */
+static LIST_HEAD(slab_caches);
+
+/*
+ * Tracking user of a slab.
+ */
+struct track {
+	unsigned long addr;	/* Called from address */
+	int cpu;		/* Was running on cpu */
+	int pid;		/* Pid context */
+	unsigned long when;	/* When did the operation occur */
+};
+
+enum track_item { TRACK_ALLOC, TRACK_FREE };
+
+static struct kmem_cache kmem_cache_cache;
+
+#ifdef CONFIG_SLQB_SYSFS
+static int sysfs_slab_add(struct kmem_cache *s);
+static void sysfs_slab_remove(struct kmem_cache *s);
+#else
+static inline int sysfs_slab_add(struct kmem_cache *s)
+{
+	return 0;
+}
+static inline void sysfs_slab_remove(struct kmem_cache *s)
+{
+	kmem_cache_free(&kmem_cache_cache, s);
+}
+#endif
+
+/********************************************************************
+ * 			Core slab cache functions
+ *******************************************************************/
+
+static int __slab_is_available __read_mostly;
+int slab_is_available(void)
+{
+	return __slab_is_available;
+}
+
+static inline struct kmem_cache_cpu *get_cpu_slab(struct kmem_cache *s, int cpu)
+{
+#ifdef CONFIG_SMP
+	VM_BUG_ON(!s->cpu_slab[cpu]);
+	return s->cpu_slab[cpu];
+#else
+	return &s->cpu_slab;
+#endif
+}
+
+static inline int check_valid_pointer(struct kmem_cache *s,
+				struct slqb_page *page, const void *object)
+{
+	void *base;
+
+	base = slqb_page_address(page);
+	if (object < base || object >= base + s->objects * s->size ||
+		(object - base) % s->size) {
+		return 0;
+	}
+
+	return 1;
+}
+
+static inline void *get_freepointer(struct kmem_cache *s, void *object)
+{
+	return *(void **)(object + s->offset);
+}
+
+static inline void set_freepointer(struct kmem_cache *s, void *object, void *fp)
+{
+	*(void **)(object + s->offset) = fp;
+}
+
+/* Loop over all objects in a slab */
+#define for_each_object(__p, __s, __addr) \
+	for (__p = (__addr); __p < (__addr) + (__s)->objects * (__s)->size;\
+			__p += (__s)->size)
+
+/* Scan freelist */
+#define for_each_free_object(__p, __s, __free) \
+	for (__p = (__free); (__p) != NULL; __p = get_freepointer((__s),\
+		__p))
+
+#ifdef CONFIG_SLQB_DEBUG
+/*
+ * Debug settings:
+ */
+#ifdef CONFIG_SLQB_DEBUG_ON
+static int slqb_debug __read_mostly = DEBUG_DEFAULT_FLAGS;
+#else
+static int slqb_debug __read_mostly;
+#endif
+
+static char *slqb_debug_slabs;
+
+/*
+ * Object debugging
+ */
+static void print_section(char *text, u8 *addr, unsigned int length)
+{
+	int i, offset;
+	int newline = 1;
+	char ascii[17];
+
+	ascii[16] = 0;
+
+	for (i = 0; i < length; i++) {
+		if (newline) {
+			printk(KERN_ERR "%8s 0x%p: ", text, addr + i);
+			newline = 0;
+		}
+		printk(KERN_CONT " %02x", addr[i]);
+		offset = i % 16;
+		ascii[offset] = isgraph(addr[i]) ? addr[i] : '.';
+		if (offset == 15) {
+			printk(KERN_CONT " %s\n", ascii);
+			newline = 1;
+		}
+	}
+	if (!newline) {
+		i %= 16;
+		while (i < 16) {
+			printk(KERN_CONT "   ");
+			ascii[i] = ' ';
+			i++;
+		}
+		printk(KERN_CONT " %s\n", ascii);
+	}
+}
+
+static struct track *get_track(struct kmem_cache *s, void *object,
+	enum track_item alloc)
+{
+	struct track *p;
+
+	if (s->offset)
+		p = object + s->offset + sizeof(void *);
+	else
+		p = object + s->inuse;
+
+	return p + alloc;
+}
+
+static void set_track(struct kmem_cache *s, void *object,
+				enum track_item alloc, unsigned long addr)
+{
+	struct track *p;
+
+	if (s->offset)
+		p = object + s->offset + sizeof(void *);
+	else
+		p = object + s->inuse;
+
+	p += alloc;
+	if (addr) {
+		p->addr = addr;
+		p->cpu = raw_smp_processor_id();
+		p->pid = current ? current->pid : -1;
+		p->when = jiffies;
+	} else
+		memset(p, 0, sizeof(struct track));
+}
+
+static void init_tracking(struct kmem_cache *s, void *object)
+{
+	if (!(s->flags & SLAB_STORE_USER))
+		return;
+
+	set_track(s, object, TRACK_FREE, 0UL);
+	set_track(s, object, TRACK_ALLOC, 0UL);
+}
+
+static void print_track(const char *s, struct track *t)
+{
+	if (!t->addr)
+		return;
+
+	printk(KERN_ERR "INFO: %s in ", s);
+	__print_symbol("%s", (unsigned long)t->addr);
+	printk(" age=%lu cpu=%u pid=%d\n", jiffies - t->when, t->cpu, t->pid);
+}
+
+static void print_tracking(struct kmem_cache *s, void *object)
+{
+	if (!(s->flags & SLAB_STORE_USER))
+		return;
+
+	print_track("Allocated", get_track(s, object, TRACK_ALLOC));
+	print_track("Freed", get_track(s, object, TRACK_FREE));
+}
+
+static void print_page_info(struct slqb_page *page)
+{
+	printk(KERN_ERR "INFO: Slab 0x%p used=%u fp=0x%p flags=0x%04lx\n",
+		page, page->inuse, page->freelist, page->flags);
+
+}
+
+#define MAX_ERR_STR 100
+static void slab_bug(struct kmem_cache *s, char *fmt, ...)
+{
+	va_list args;
+	char buf[MAX_ERR_STR];
+
+	va_start(args, fmt);
+	vsnprintf(buf, sizeof(buf), fmt, args);
+	va_end(args);
+	printk(KERN_ERR "========================================"
+			"=====================================\n");
+	printk(KERN_ERR "BUG %s: %s\n", s->name, buf);
+	printk(KERN_ERR "----------------------------------------"
+			"-------------------------------------\n\n");
+}
+
+static void slab_fix(struct kmem_cache *s, char *fmt, ...)
+{
+	va_list args;
+	char buf[100];
+
+	va_start(args, fmt);
+	vsnprintf(buf, sizeof(buf), fmt, args);
+	va_end(args);
+	printk(KERN_ERR "FIX %s: %s\n", s->name, buf);
+}
+
+static void print_trailer(struct kmem_cache *s, struct slqb_page *page, u8 *p)
+{
+	unsigned int off;	/* Offset of last byte */
+	u8 *addr = slqb_page_address(page);
+
+	print_tracking(s, p);
+
+	print_page_info(page);
+
+	printk(KERN_ERR "INFO: Object 0x%p @offset=%tu fp=0x%p\n\n",
+			p, p - addr, get_freepointer(s, p));
+
+	if (p > addr + 16)
+		print_section("Bytes b4", p - 16, 16);
+
+	print_section("Object", p, min(s->objsize, 128));
+
+	if (s->flags & SLAB_RED_ZONE)
+		print_section("Redzone", p + s->objsize, s->inuse - s->objsize);
+
+	if (s->offset)
+		off = s->offset + sizeof(void *);
+	else
+		off = s->inuse;
+
+	if (s->flags & SLAB_STORE_USER)
+		off += 2 * sizeof(struct track);
+
+	if (off != s->size) {
+		/* Beginning of the filler is the free pointer */
+		print_section("Padding", p + off, s->size - off);
+	}
+
+	dump_stack();
+}
+
+static void object_err(struct kmem_cache *s, struct slqb_page *page,
+			u8 *object, char *reason)
+{
+	slab_bug(s, reason);
+	print_trailer(s, page, object);
+}
+
+static void slab_err(struct kmem_cache *s, struct slqb_page *page,
+			char *fmt, ...)
+{
+	slab_bug(s, fmt);
+	print_page_info(page);
+	dump_stack();
+}
+
+static void init_object(struct kmem_cache *s, void *object, int active)
+{
+	u8 *p = object;
+
+	if (s->flags & __OBJECT_POISON) {
+		memset(p, POISON_FREE, s->objsize - 1);
+		p[s->objsize - 1] = POISON_END;
+	}
+
+	if (s->flags & SLAB_RED_ZONE) {
+		memset(p + s->objsize,
+			active ? SLUB_RED_ACTIVE : SLUB_RED_INACTIVE,
+			s->inuse - s->objsize);
+	}
+}
+
+static u8 *check_bytes(u8 *start, unsigned int value, unsigned int bytes)
+{
+	while (bytes) {
+		if (*start != (u8)value)
+			return start;
+		start++;
+		bytes--;
+	}
+	return NULL;
+}
+
+static void restore_bytes(struct kmem_cache *s, char *message, u8 data,
+				void *from, void *to)
+{
+	slab_fix(s, "Restoring 0x%p-0x%p=0x%x\n", from, to - 1, data);
+	memset(from, data, to - from);
+}
+
+static int check_bytes_and_report(struct kmem_cache *s, struct slqb_page *page,
+			u8 *object, char *what,
+			u8 *start, unsigned int value, unsigned int bytes)
+{
+	u8 *fault;
+	u8 *end;
+
+	fault = check_bytes(start, value, bytes);
+	if (!fault)
+		return 1;
+
+	end = start + bytes;
+	while (end > fault && end[-1] == value)
+		end--;
+
+	slab_bug(s, "%s overwritten", what);
+	printk(KERN_ERR "INFO: 0x%p-0x%p. First byte 0x%x instead of 0x%x\n",
+					fault, end - 1, fault[0], value);
+	print_trailer(s, page, object);
+
+	restore_bytes(s, what, value, fault, end);
+	return 0;
+}
+
+/*
+ * Object layout:
+ *
+ * object address
+ * 	Bytes of the object to be managed.
+ * 	If the freepointer may overlay the object then the free
+ * 	pointer is the first word of the object.
+ *
+ * 	Poisoning uses 0x6b (POISON_FREE) and the last byte is
+ * 	0xa5 (POISON_END)
+ *
+ * object + s->objsize
+ * 	Padding to reach word boundary. This is also used for Redzoning.
+ * 	Padding is extended by another word if Redzoning is enabled and
+ * 	objsize == inuse.
+ *
+ * 	We fill with 0xbb (RED_INACTIVE) for inactive objects and with
+ * 	0xcc (RED_ACTIVE) for objects in use.
+ *
+ * object + s->inuse
+ * 	Meta data starts here.
+ *
+ * 	A. Free pointer (if we cannot overwrite object on free)
+ * 	B. Tracking data for SLAB_STORE_USER
+ * 	C. Padding to reach required alignment boundary or at mininum
+ * 		one word if debuggin is on to be able to detect writes
+ * 		before the word boundary.
+ *
+ *	Padding is done using 0x5a (POISON_INUSE)
+ *
+ * object + s->size
+ * 	Nothing is used beyond s->size.
+ */
+
+static int check_pad_bytes(struct kmem_cache *s, struct slqb_page *page, u8 *p)
+{
+	unsigned long off = s->inuse;	/* The end of info */
+
+	if (s->offset) {
+		/* Freepointer is placed after the object. */
+		off += sizeof(void *);
+	}
+
+	if (s->flags & SLAB_STORE_USER) {
+		/* We also have user information there */
+		off += 2 * sizeof(struct track);
+	}
+
+	if (s->size == off)
+		return 1;
+
+	return check_bytes_and_report(s, page, p, "Object padding",
+				p + off, POISON_INUSE, s->size - off);
+}
+
+static int slab_pad_check(struct kmem_cache *s, struct slqb_page *page)
+{
+	u8 *start;
+	u8 *fault;
+	u8 *end;
+	int length;
+	int remainder;
+
+	if (!(s->flags & SLAB_POISON))
+		return 1;
+
+	start = slqb_page_address(page);
+	end = start + (PAGE_SIZE << s->order);
+	length = s->objects * s->size;
+	remainder = end - (start + length);
+	if (!remainder)
+		return 1;
+
+	fault = check_bytes(start + length, POISON_INUSE, remainder);
+	if (!fault)
+		return 1;
+
+	while (end > fault && end[-1] == POISON_INUSE)
+		end--;
+
+	slab_err(s, page, "Padding overwritten. 0x%p-0x%p", fault, end - 1);
+	print_section("Padding", start, length);
+
+	restore_bytes(s, "slab padding", POISON_INUSE, start, end);
+	return 0;
+}
+
+static int check_object(struct kmem_cache *s, struct slqb_page *page,
+					void *object, int active)
+{
+	u8 *p = object;
+	u8 *endobject = object + s->objsize;
+
+	if (s->flags & SLAB_RED_ZONE) {
+		unsigned int red =
+			active ? SLUB_RED_ACTIVE : SLUB_RED_INACTIVE;
+
+		if (!check_bytes_and_report(s, page, object, "Redzone",
+			endobject, red, s->inuse - s->objsize))
+			return 0;
+	} else {
+		if ((s->flags & SLAB_POISON) && s->objsize < s->inuse) {
+			check_bytes_and_report(s, page, p, "Alignment padding",
+				endobject, POISON_INUSE, s->inuse - s->objsize);
+		}
+	}
+
+	if (s->flags & SLAB_POISON) {
+		if (!active && (s->flags & __OBJECT_POISON)) {
+			if (!check_bytes_and_report(s, page, p, "Poison", p,
+					POISON_FREE, s->objsize - 1))
+				return 0;
+
+			if (!check_bytes_and_report(s, page, p, "Poison",
+					p + s->objsize - 1, POISON_END, 1))
+				return 0;
+		}
+
+		/*
+		 * check_pad_bytes cleans up on its own.
+		 */
+		check_pad_bytes(s, page, p);
+	}
+
+	return 1;
+}
+
+static int check_slab(struct kmem_cache *s, struct slqb_page *page)
+{
+	if (!(page->flags & PG_SLQB_BIT)) {
+		slab_err(s, page, "Not a valid slab page");
+		return 0;
+	}
+	if (page->inuse == 0) {
+		slab_err(s, page, "inuse before free / after alloc", s->name);
+		return 0;
+	}
+	if (page->inuse > s->objects) {
+		slab_err(s, page, "inuse %u > max %u",
+			s->name, page->inuse, s->objects);
+		return 0;
+	}
+	/* Slab_pad_check fixes things up after itself */
+	slab_pad_check(s, page);
+	return 1;
+}
+
+static void trace(struct kmem_cache *s, struct slqb_page *page,
+			void *object, int alloc)
+{
+	if (s->flags & SLAB_TRACE) {
+		printk(KERN_INFO "TRACE %s %s 0x%p inuse=%d fp=0x%p\n",
+			s->name,
+			alloc ? "alloc" : "free",
+			object, page->inuse,
+			page->freelist);
+
+		if (!alloc)
+			print_section("Object", (void *)object, s->objsize);
+
+		dump_stack();
+	}
+}
+
+static void setup_object_debug(struct kmem_cache *s, struct slqb_page *page,
+				void *object)
+{
+	if (!slab_debug(s))
+		return;
+
+	if (!(s->flags & (SLAB_STORE_USER|SLAB_RED_ZONE|__OBJECT_POISON)))
+		return;
+
+	init_object(s, object, 0);
+	init_tracking(s, object);
+}
+
+static int alloc_debug_processing(struct kmem_cache *s,
+					void *object, unsigned long addr)
+{
+	struct slqb_page *page;
+	page = virt_to_head_slqb_page(object);
+
+	if (!check_slab(s, page))
+		goto bad;
+
+	if (!check_valid_pointer(s, page, object)) {
+		object_err(s, page, object, "Freelist Pointer check fails");
+		goto bad;
+	}
+
+	if (object && !check_object(s, page, object, 0))
+		goto bad;
+
+	/* Success perform special debug activities for allocs */
+	if (s->flags & SLAB_STORE_USER)
+		set_track(s, object, TRACK_ALLOC, addr);
+	trace(s, page, object, 1);
+	init_object(s, object, 1);
+	return 1;
+
+bad:
+	return 0;
+}
+
+static int free_debug_processing(struct kmem_cache *s,
+					void *object, unsigned long addr)
+{
+	struct slqb_page *page;
+	page = virt_to_head_slqb_page(object);
+
+	if (!check_slab(s, page))
+		goto fail;
+
+	if (!check_valid_pointer(s, page, object)) {
+		slab_err(s, page, "Invalid object pointer 0x%p", object);
+		goto fail;
+	}
+
+	if (!check_object(s, page, object, 1))
+		return 0;
+
+	/* Special debug activities for freeing objects */
+	if (s->flags & SLAB_STORE_USER)
+		set_track(s, object, TRACK_FREE, addr);
+	trace(s, page, object, 0);
+	init_object(s, object, 0);
+	return 1;
+
+fail:
+	slab_fix(s, "Object at 0x%p not freed", object);
+	return 0;
+}
+
+static int __init setup_slqb_debug(char *str)
+{
+	slqb_debug = DEBUG_DEFAULT_FLAGS;
+	if (*str++ != '=' || !*str) {
+		/*
+		 * No options specified. Switch on full debugging.
+		 */
+		goto out;
+	}
+
+	if (*str == ',') {
+		/*
+		 * No options but restriction on slabs. This means full
+		 * debugging for slabs matching a pattern.
+		 */
+		goto check_slabs;
+	}
+
+	slqb_debug = 0;
+	if (*str == '-') {
+		/*
+		 * Switch off all debugging measures.
+		 */
+		goto out;
+	}
+
+	/*
+	 * Determine which debug features should be switched on
+	 */
+	for (; *str && *str != ','; str++) {
+		switch (tolower(*str)) {
+		case 'f':
+			slqb_debug |= SLAB_DEBUG_FREE;
+			break;
+		case 'z':
+			slqb_debug |= SLAB_RED_ZONE;
+			break;
+		case 'p':
+			slqb_debug |= SLAB_POISON;
+			break;
+		case 'u':
+			slqb_debug |= SLAB_STORE_USER;
+			break;
+		case 't':
+			slqb_debug |= SLAB_TRACE;
+			break;
+		case 'a':
+			slqb_debug |= SLAB_FAILSLAB;
+			break;
+		default:
+			printk(KERN_ERR "slqb_debug option '%c' "
+				"unknown. skipped\n", *str);
+		}
+	}
+
+check_slabs:
+	if (*str == ',')
+		slqb_debug_slabs = str + 1;
+out:
+	return 1;
+}
+__setup("slqb_debug", setup_slqb_debug);
+
+static int __init setup_slqb_min_order(char *str)
+{
+	get_option(&str, &slqb_min_order);
+	slqb_min_order = min(slqb_min_order, MAX_ORDER - 1);
+
+	return 1;
+}
+__setup("slqb_min_order=", setup_slqb_min_order);
+
+static int __init setup_slqb_min_objects(char *str)
+{
+	get_option(&str, &slqb_min_objects);
+
+	return 1;
+}
+
+__setup("slqb_min_objects=", setup_slqb_min_objects);
+
+static unsigned long kmem_cache_flags(unsigned long objsize,
+				unsigned long flags, const char *name,
+				void (*ctor)(void *))
+{
+	/*
+	 * Enable debugging if selected on the kernel commandline.
+	 */
+	if (slqb_debug && (!slqb_debug_slabs ||
+	    strncmp(slqb_debug_slabs, name,
+		strlen(slqb_debug_slabs)) == 0))
+			flags |= slqb_debug;
+
+	if (num_possible_nodes() > 1)
+		flags |= SLAB_NUMA;
+
+	return flags;
+}
+#else
+static inline void setup_object_debug(struct kmem_cache *s,
+			struct slqb_page *page, void *object)
+{
+}
+
+static inline int alloc_debug_processing(struct kmem_cache *s,
+			void *object, unsigned long addr)
+{
+	return 0;
+}
+
+static inline int free_debug_processing(struct kmem_cache *s,
+			void *object, unsigned long addr)
+{
+	return 0;
+}
+
+static inline int slab_pad_check(struct kmem_cache *s, struct slqb_page *page)
+{
+	return 1;
+}
+
+static inline int check_object(struct kmem_cache *s, struct slqb_page *page,
+			void *object, int active)
+{
+	return 1;
+}
+
+static inline void add_full(struct kmem_cache_node *n, struct slqb_page *page)
+{
+}
+
+static inline unsigned long kmem_cache_flags(unsigned long objsize,
+	unsigned long flags, const char *name, void (*ctor)(void *))
+{
+	if (num_possible_nodes() > 1)
+		flags |= SLAB_NUMA;
+	return flags;
+}
+
+static const int slqb_debug;
+#endif
+
+/*
+ * allocate a new slab (return its corresponding struct slqb_page)
+ */
+static struct slqb_page *allocate_slab(struct kmem_cache *s,
+					gfp_t flags, int node)
+{
+	struct slqb_page *page;
+	int pages = 1 << s->order;
+
+	flags |= s->allocflags;
+
+	page = (struct slqb_page *)alloc_pages_node(node, flags, s->order);
+	if (!page)
+		return NULL;
+
+	mod_zone_page_state(slqb_page_zone(page),
+		(s->flags & SLAB_RECLAIM_ACCOUNT) ?
+		NR_SLAB_RECLAIMABLE : NR_SLAB_UNRECLAIMABLE,
+		pages);
+
+	return page;
+}
+
+/*
+ * Called once for each object on a new slab page
+ */
+static void setup_object(struct kmem_cache *s,
+				struct slqb_page *page, void *object)
+{
+	setup_object_debug(s, page, object);
+	if (unlikely(s->ctor))
+		s->ctor(object);
+}
+
+/*
+ * Allocate a new slab, set up its object list.
+ */
+static struct slqb_page *new_slab_page(struct kmem_cache *s,
+				gfp_t flags, int node, unsigned int colour)
+{
+	struct slqb_page *page;
+	void *start;
+	void *last;
+	void *p;
+
+	BUG_ON(flags & GFP_SLAB_BUG_MASK);
+
+	page = allocate_slab(s,
+		flags & (GFP_RECLAIM_MASK | GFP_CONSTRAINT_MASK), node);
+	if (!page)
+		goto out;
+
+	page->flags |= PG_SLQB_BIT;
+
+	start = page_address(&page->page);
+
+	if (unlikely(slab_poison(s)))
+		memset(start, POISON_INUSE, PAGE_SIZE << s->order);
+
+	start += colour;
+
+	last = start;
+	for_each_object(p, s, start) {
+		setup_object(s, page, p);
+		set_freepointer(s, last, p);
+		last = p;
+	}
+	set_freepointer(s, last, NULL);
+
+	page->freelist = start;
+	page->inuse = 0;
+out:
+	return page;
+}
+
+/*
+ * Free a slab page back to the page allocator
+ */
+static void __free_slab(struct kmem_cache *s, struct slqb_page *page)
+{
+	int pages = 1 << s->order;
+
+	if (unlikely(slab_debug(s))) {
+		void *p;
+
+		slab_pad_check(s, page);
+		for_each_free_object(p, s, page->freelist)
+			check_object(s, page, p, 0);
+	}
+
+	mod_zone_page_state(slqb_page_zone(page),
+		(s->flags & SLAB_RECLAIM_ACCOUNT) ?
+		NR_SLAB_RECLAIMABLE : NR_SLAB_UNRECLAIMABLE,
+		-pages);
+
+	__free_slqb_pages(page, s->order, pages);
+}
+
+static void rcu_free_slab(struct rcu_head *h)
+{
+	struct slqb_page *page;
+
+	page = container_of(h, struct slqb_page, rcu_head);
+	__free_slab(page->list->cache, page);
+}
+
+static void free_slab(struct kmem_cache *s, struct slqb_page *page)
+{
+	VM_BUG_ON(page->inuse);
+	if (unlikely(s->flags & SLAB_DESTROY_BY_RCU))
+		call_rcu(&page->rcu_head, rcu_free_slab);
+	else
+		__free_slab(s, page);
+}
+
+/*
+ * Return an object to its slab.
+ *
+ * Caller must be the owner CPU in the case of per-CPU list, or hold the node's
+ * list_lock in the case of per-node list.
+ */
+static int free_object_to_page(struct kmem_cache *s,
+			struct kmem_cache_list *l, struct slqb_page *page,
+			void *object)
+{
+	VM_BUG_ON(page->list != l);
+
+	set_freepointer(s, object, page->freelist);
+	page->freelist = object;
+	page->inuse--;
+
+	if (!page->inuse) {
+		if (likely(s->objects > 1)) {
+			l->nr_partial--;
+			list_del(&page->lru);
+		}
+		l->nr_slabs--;
+		free_slab(s, page);
+		slqb_stat_inc(l, FLUSH_SLAB_FREE);
+		return 1;
+
+	} else if (page->inuse + 1 == s->objects) {
+		l->nr_partial++;
+		list_add(&page->lru, &l->partial);
+		slqb_stat_inc(l, FLUSH_SLAB_PARTIAL);
+		return 0;
+	}
+	return 0;
+}
+
+#ifdef CONFIG_SMP
+static void slab_free_to_remote(struct kmem_cache *s, struct slqb_page *page,
+				void *object, struct kmem_cache_cpu *c);
+#endif
+
+/*
+ * Flush the LIFO list of objects on a list. They are sent back to their pages
+ * in case the pages also belong to the list, or to our CPU's remote-free list
+ * in the case they do not.
+ *
+ * Doesn't flush the entire list. flush_free_list_all does.
+ *
+ * Caller must be the owner CPU in the case of per-CPU list, or hold the node's
+ * list_lock in the case of per-node list.
+ */
+static void flush_free_list(struct kmem_cache *s, struct kmem_cache_list *l)
+{
+	void **head;
+	int nr;
+	int locked = 0;
+
+	nr = l->freelist.nr;
+	if (unlikely(!nr))
+		return;
+
+	nr = min(slab_freebatch(s), nr);
+
+	slqb_stat_inc(l, FLUSH_FREE_LIST);
+	slqb_stat_add(l, FLUSH_FREE_LIST_OBJECTS, nr);
+
+	l->freelist.nr -= nr;
+	head = l->freelist.head;
+
+	do {
+		struct slqb_page *page;
+		void **object;
+
+		object = head;
+		VM_BUG_ON(!object);
+		head = get_freepointer(s, object);
+		page = virt_to_head_slqb_page(object);
+
+#ifdef CONFIG_SMP
+		if (page->list != l) {
+			struct kmem_cache_cpu *c;
+
+			if (locked) {
+				spin_unlock(&l->page_lock);
+				locked = 0;
+			}
+
+			c = get_cpu_slab(s, smp_processor_id());
+
+			slab_free_to_remote(s, page, object, c);
+			slqb_stat_inc(l, FLUSH_FREE_LIST_REMOTE);
+		} else
+#endif
+		{
+			if (!locked) {
+				spin_lock(&l->page_lock);
+				locked = 1;
+			}
+			free_object_to_page(s, l, page, object);
+		}
+
+		nr--;
+	} while (nr);
+
+	if (locked)
+		spin_unlock(&l->page_lock);
+
+	l->freelist.head = head;
+	if (!l->freelist.nr)
+		l->freelist.tail = NULL;
+}
+
+static void flush_free_list_all(struct kmem_cache *s, struct kmem_cache_list *l)
+{
+	while (l->freelist.nr)
+		flush_free_list(s, l);
+}
+
+#ifdef CONFIG_SMP
+/*
+ * If enough objects have been remotely freed back to this list,
+ * remote_free_check will be set. In which case, we'll eventually come here
+ * to take those objects off our remote_free list and onto our LIFO freelist.
+ *
+ * Caller must be the owner CPU in the case of per-CPU list, or hold the node's
+ * list_lock in the case of per-node list.
+ */
+static void claim_remote_free_list(struct kmem_cache *s,
+					struct kmem_cache_list *l)
+{
+	void **head, **tail;
+	int nr;
+
+	if (!l->remote_free.list.nr)
+		return;
+
+	spin_lock(&l->remote_free.lock);
+
+	l->remote_free_check = 0;
+	head = l->remote_free.list.head;
+	l->remote_free.list.head = NULL;
+	tail = l->remote_free.list.tail;
+	l->remote_free.list.tail = NULL;
+	nr = l->remote_free.list.nr;
+	l->remote_free.list.nr = 0;
+
+	spin_unlock(&l->remote_free.lock);
+
+	VM_BUG_ON(!nr);
+
+	if (!l->freelist.nr) {
+		/* Get head hot for likely subsequent allocation or flush */
+		prefetchw(head);
+		l->freelist.head = head;
+	} else
+		set_freepointer(s, l->freelist.tail, head);
+	l->freelist.tail = tail;
+
+	l->freelist.nr += nr;
+
+	slqb_stat_inc(l, CLAIM_REMOTE_LIST);
+	slqb_stat_add(l, CLAIM_REMOTE_LIST_OBJECTS, nr);
+}
+#else
+static inline void claim_remote_free_list(struct kmem_cache *s,
+					struct kmem_cache_list *l)
+{
+}
+#endif
+
+/*
+ * Allocation fastpath. Get an object from the list's LIFO freelist, or
+ * return NULL if it is empty.
+ *
+ * Caller must be the owner CPU in the case of per-CPU list, or hold the node's
+ * list_lock in the case of per-node list.
+ */
+static __always_inline void *__cache_list_get_object(struct kmem_cache *s,
+						struct kmem_cache_list *l)
+{
+	void *object;
+
+	object = l->freelist.head;
+	if (likely(object)) {
+		void *next = get_freepointer(s, object);
+
+		VM_BUG_ON(!l->freelist.nr);
+		l->freelist.nr--;
+		l->freelist.head = next;
+
+		return object;
+	}
+	VM_BUG_ON(l->freelist.nr);
+
+#ifdef CONFIG_SMP
+	if (unlikely(l->remote_free_check)) {
+		claim_remote_free_list(s, l);
+
+		if (l->freelist.nr > slab_hiwater(s))
+			flush_free_list(s, l);
+
+		/* repetition here helps gcc :( */
+		object = l->freelist.head;
+		if (likely(object)) {
+			void *next = get_freepointer(s, object);
+
+			VM_BUG_ON(!l->freelist.nr);
+			l->freelist.nr--;
+			l->freelist.head = next;
+
+			return object;
+		}
+		VM_BUG_ON(l->freelist.nr);
+	}
+#endif
+
+	return NULL;
+}
+
+/*
+ * Slow(er) path. Get a page from this list's existing pages. Will be a
+ * new empty page in the case that __slab_alloc_page has just been called
+ * (empty pages otherwise never get queued up on the lists), or a partial page
+ * already on the list.
+ *
+ * Caller must be the owner CPU in the case of per-CPU list, or hold the node's
+ * list_lock in the case of per-node list.
+ */
+static noinline void *__cache_list_get_page(struct kmem_cache *s,
+				struct kmem_cache_list *l)
+{
+	struct slqb_page *page;
+	void *object;
+
+	if (unlikely(!l->nr_partial))
+		return NULL;
+
+	page = list_first_entry(&l->partial, struct slqb_page, lru);
+	VM_BUG_ON(page->inuse == s->objects);
+	if (page->inuse + 1 == s->objects) {
+		l->nr_partial--;
+		list_del(&page->lru);
+	}
+
+	VM_BUG_ON(!page->freelist);
+
+	page->inuse++;
+
+	object = page->freelist;
+	page->freelist = get_freepointer(s, object);
+	if (page->freelist)
+		prefetchw(page->freelist);
+	VM_BUG_ON((page->inuse == s->objects) != (page->freelist == NULL));
+	slqb_stat_inc(l, ALLOC_SLAB_FILL);
+
+	return object;
+}
+
+static void *cache_list_get_page(struct kmem_cache *s,
+				struct kmem_cache_list *l)
+{
+	void *object;
+
+	if (unlikely(!l->nr_partial))
+		return NULL;
+
+	spin_lock(&l->page_lock);
+	object = __cache_list_get_page(s, l);
+	spin_unlock(&l->page_lock);
+
+	return object;
+}
+
+/*
+ * Allocation slowpath. Allocate a new slab page from the page allocator, and
+ * put it on the list's partial list. Must be followed by an allocation so
+ * that we don't have dangling empty pages on the partial list.
+ *
+ * Returns 0 on allocation failure.
+ *
+ * Must be called with interrupts disabled.
+ */
+static noinline void *__slab_alloc_page(struct kmem_cache *s,
+				gfp_t gfpflags, int node)
+{
+	struct slqb_page *page;
+	struct kmem_cache_list *l;
+	struct kmem_cache_cpu *c;
+	unsigned int colour;
+	void *object;
+
+	c = get_cpu_slab(s, smp_processor_id());
+	colour = c->colour_next;
+	c->colour_next += s->colour_off;
+	if (c->colour_next >= s->colour_range)
+		c->colour_next = 0;
+
+	/* Caller handles __GFP_ZERO */
+	gfpflags &= ~__GFP_ZERO;
+
+	if (gfpflags & __GFP_WAIT)
+		local_irq_enable();
+	page = new_slab_page(s, gfpflags, node, colour);
+	if (gfpflags & __GFP_WAIT)
+		local_irq_disable();
+	if (unlikely(!page))
+		return page;
+
+	if (!NUMA_BUILD || likely(slqb_page_to_nid(page) == numa_node_id())) {
+		struct kmem_cache_cpu *c;
+		int cpu = smp_processor_id();
+
+		c = get_cpu_slab(s, cpu);
+		l = &c->list;
+		page->list = l;
+
+		spin_lock(&l->page_lock);
+		l->nr_slabs++;
+		l->nr_partial++;
+		list_add(&page->lru, &l->partial);
+		slqb_stat_inc(l, ALLOC);
+		slqb_stat_inc(l, ALLOC_SLAB_NEW);
+		object = __cache_list_get_page(s, l);
+		spin_unlock(&l->page_lock);
+	} else {
+#ifdef CONFIG_NUMA
+		struct kmem_cache_node *n;
+
+		n = s->node_slab[slqb_page_to_nid(page)];
+		l = &n->list;
+		page->list = l;
+
+		spin_lock(&n->list_lock);
+		spin_lock(&l->page_lock);
+		l->nr_slabs++;
+		l->nr_partial++;
+		list_add(&page->lru, &l->partial);
+		slqb_stat_inc(l, ALLOC);
+		slqb_stat_inc(l, ALLOC_SLAB_NEW);
+		object = __cache_list_get_page(s, l);
+		spin_unlock(&l->page_lock);
+		spin_unlock(&n->list_lock);
+#endif
+	}
+	VM_BUG_ON(!object);
+	return object;
+}
+
+#ifdef CONFIG_NUMA
+static noinline int alternate_nid(struct kmem_cache *s,
+				gfp_t gfpflags, int node)
+{
+	if (in_interrupt() || (gfpflags & __GFP_THISNODE))
+		return node;
+	if (cpuset_do_slab_mem_spread() && (s->flags & SLAB_MEM_SPREAD))
+		return cpuset_mem_spread_node();
+	else if (current->mempolicy)
+		return slab_node(current->mempolicy);
+	return node;
+}
+
+/*
+ * Allocate an object from a remote node. Return NULL if none could be found
+ * (in which case, caller should allocate a new slab)
+ *
+ * Must be called with interrupts disabled.
+ */
+static void *__remote_slab_alloc_node(struct kmem_cache *s,
+				gfp_t gfpflags, int node)
+{
+	struct kmem_cache_node *n;
+	struct kmem_cache_list *l;
+	void *object;
+
+	n = s->node_slab[node];
+	if (unlikely(!n)) /* node has no memory */
+		return NULL;
+	l = &n->list;
+
+	spin_lock(&n->list_lock);
+
+	object = __cache_list_get_object(s, l);
+	if (unlikely(!object)) {
+		object = cache_list_get_page(s, l);
+		if (unlikely(!object)) {
+			spin_unlock(&n->list_lock);
+			return __slab_alloc_page(s, gfpflags, node);
+		}
+	}
+	if (likely(object))
+		slqb_stat_inc(l, ALLOC);
+	spin_unlock(&n->list_lock);
+	return object;
+}
+
+static noinline void *__remote_slab_alloc(struct kmem_cache *s,
+				gfp_t gfpflags, int node)
+{
+	void *object;
+	struct zonelist *zonelist;
+	struct zoneref *z;
+	struct zone *zone;
+	enum zone_type high_zoneidx = gfp_zone(gfpflags);
+
+	object = __remote_slab_alloc_node(s, gfpflags, node);
+	if (likely(object || (gfpflags & __GFP_THISNODE)))
+		return object;
+
+	zonelist = node_zonelist(slab_node(current->mempolicy), gfpflags);
+	for_each_zone_zonelist(zone, z, zonelist, high_zoneidx) {
+		if (!cpuset_zone_allowed_hardwall(zone, gfpflags))
+			continue;
+
+		node = zone_to_nid(zone);
+		object = __remote_slab_alloc_node(s, gfpflags, node);
+		if (likely(object))
+			return object;
+	}
+	return NULL;
+}
+#endif
+
+/*
+ * Main allocation path. Return an object, or NULL on allocation failure.
+ *
+ * Must be called with interrupts disabled.
+ */
+static __always_inline void *__slab_alloc(struct kmem_cache *s,
+				gfp_t gfpflags, int node)
+{
+	void *object;
+	struct kmem_cache_cpu *c;
+	struct kmem_cache_list *l;
+
+#ifdef CONFIG_NUMA
+	if (unlikely(node != -1) && unlikely(node != numa_node_id())) {
+try_remote:
+		return __remote_slab_alloc(s, gfpflags, node);
+	}
+#endif
+
+	c = get_cpu_slab(s, smp_processor_id());
+	VM_BUG_ON(!c);
+	l = &c->list;
+	object = __cache_list_get_object(s, l);
+	if (unlikely(!object)) {
+#ifdef CONFIG_NUMA
+		int thisnode = numa_node_id();
+
+		/*
+		 * If the local node is memoryless, try remote alloc before
+		 * trying the page allocator. Otherwise, what happens is
+		 * objects are always freed to remote lists but the allocation
+		 * side always allocates a new page with only one object
+		 * used in each page
+		 */
+		if (unlikely(!node_state(thisnode, N_HIGH_MEMORY)))
+			object = __remote_slab_alloc(s, gfpflags, thisnode);
+#endif
+
+		if (!object) {
+			object = cache_list_get_page(s, l);
+			if (unlikely(!object)) {
+				object = __slab_alloc_page(s, gfpflags, node);
+#ifdef CONFIG_NUMA
+				if (unlikely(!object)) {
+					node = numa_node_id();
+					goto try_remote;
+				}
+#endif
+				return object;
+			}
+		}
+	}
+	if (likely(object))
+		slqb_stat_inc(l, ALLOC);
+	return object;
+}
+
+/*
+ * Perform some interrupts-on processing around the main allocation path
+ * (debug checking and memset()ing).
+ */
+static __always_inline void *slab_alloc(struct kmem_cache *s,
+				gfp_t gfpflags, int node, unsigned long addr)
+{
+	void *object;
+	unsigned long flags;
+
+	gfpflags &= gfp_allowed_mask;
+
+	lockdep_trace_alloc(gfpflags);
+	might_sleep_if(gfpflags & __GFP_WAIT);
+
+	if (should_failslab(s->objsize, gfpflags))
+		return NULL;
+
+again:
+	local_irq_save(flags);
+	object = __slab_alloc(s, gfpflags, node);
+	local_irq_restore(flags);
+
+	if (unlikely(slab_debug(s)) && likely(object)) {
+		if (unlikely(!alloc_debug_processing(s, object, addr)))
+			goto again;
+	}
+
+	if (unlikely(gfpflags & __GFP_ZERO) && likely(object))
+		memset(object, 0, s->objsize);
+
+	return object;
+}
+
+static __always_inline void *__kmem_cache_alloc(struct kmem_cache *s,
+				gfp_t gfpflags, unsigned long caller)
+{
+	int node = -1;
+
+#ifdef CONFIG_NUMA
+	if (unlikely(current->flags & (PF_SPREAD_SLAB | PF_MEMPOLICY)))
+		node = alternate_nid(s, gfpflags, node);
+#endif
+	return slab_alloc(s, gfpflags, node, caller);
+}
+
+void *kmem_cache_alloc(struct kmem_cache *s, gfp_t gfpflags)
+{
+	return __kmem_cache_alloc(s, gfpflags, _RET_IP_);
+}
+EXPORT_SYMBOL(kmem_cache_alloc);
+
+#ifdef CONFIG_NUMA
+void *kmem_cache_alloc_node(struct kmem_cache *s, gfp_t gfpflags, int node)
+{
+	return slab_alloc(s, gfpflags, node, _RET_IP_);
+}
+EXPORT_SYMBOL(kmem_cache_alloc_node);
+#endif
+
+#ifdef CONFIG_SMP
+/*
+ * Flush this CPU's remote free list of objects back to the list from where
+ * they originate. They end up on that list's remotely freed list, and
+ * eventually we set it's remote_free_check if there are enough objects on it.
+ *
+ * This seems convoluted, but it keeps is from stomping on the target CPU's
+ * fastpath cachelines.
+ *
+ * Must be called with interrupts disabled.
+ */
+static void flush_remote_free_cache(struct kmem_cache *s,
+				struct kmem_cache_cpu *c)
+{
+	struct kmlist *src;
+	struct kmem_cache_list *dst;
+	unsigned int nr;
+	int set;
+
+	src = &c->rlist;
+	nr = src->nr;
+	if (unlikely(!nr))
+		return;
+
+#ifdef CONFIG_SLQB_STATS
+	{
+		struct kmem_cache_list *l = &c->list;
+
+		slqb_stat_inc(l, FLUSH_RFREE_LIST);
+		slqb_stat_add(l, FLUSH_RFREE_LIST_OBJECTS, nr);
+	}
+#endif
+
+	dst = c->remote_cache_list;
+
+	/*
+	 * Less common case, dst is filling up so free synchronously.
+	 * No point in having remote CPU free thse as it will just
+	 * free them back to the page list anyway.
+	 */
+	if (unlikely(dst->remote_free.list.nr > (slab_hiwater(s) >> 1))) {
+		void **head;
+
+		head = src->head;
+		spin_lock(&dst->page_lock);
+		do {
+			struct slqb_page *page;
+			void **object;
+
+			object = head;
+			VM_BUG_ON(!object);
+			head = get_freepointer(s, object);
+			page = virt_to_head_slqb_page(object);
+
+			free_object_to_page(s, dst, page, object);
+			nr--;
+		} while (nr);
+		spin_unlock(&dst->page_lock);
+
+		src->head = NULL;
+		src->tail = NULL;
+		src->nr = 0;
+
+		return;
+	}
+
+	spin_lock(&dst->remote_free.lock);
+
+	if (!dst->remote_free.list.head)
+		dst->remote_free.list.head = src->head;
+	else
+		set_freepointer(s, dst->remote_free.list.tail, src->head);
+	dst->remote_free.list.tail = src->tail;
+
+	src->head = NULL;
+	src->tail = NULL;
+	src->nr = 0;
+
+	if (dst->remote_free.list.nr < slab_freebatch(s))
+		set = 1;
+	else
+		set = 0;
+
+	dst->remote_free.list.nr += nr;
+
+	if (unlikely(dst->remote_free.list.nr >= slab_freebatch(s) && set))
+		dst->remote_free_check = 1;
+
+	spin_unlock(&dst->remote_free.lock);
+}
+
+/*
+ * Free an object to this CPU's remote free list.
+ *
+ * Must be called with interrupts disabled.
+ */
+static noinline void slab_free_to_remote(struct kmem_cache *s,
+				struct slqb_page *page, void *object,
+				struct kmem_cache_cpu *c)
+{
+	struct kmlist *r;
+
+	/*
+	 * Our remote free list corresponds to a different list. Must
+	 * flush it and switch.
+	 */
+	if (page->list != c->remote_cache_list) {
+		flush_remote_free_cache(s, c);
+		c->remote_cache_list = page->list;
+	}
+
+	r = &c->rlist;
+	if (!r->head)
+		r->head = object;
+	else
+		set_freepointer(s, r->tail, object);
+	set_freepointer(s, object, NULL);
+	r->tail = object;
+	r->nr++;
+
+	if (unlikely(r->nr >= slab_freebatch(s)))
+		flush_remote_free_cache(s, c);
+}
+#endif
+
+/*
+ * Main freeing path. Return an object, or NULL on allocation failure.
+ *
+ * Must be called with interrupts disabled.
+ */
+static __always_inline void __slab_free(struct kmem_cache *s,
+				struct slqb_page *page, void *object)
+{
+	struct kmem_cache_cpu *c;
+	struct kmem_cache_list *l;
+	int thiscpu = smp_processor_id();
+
+	c = get_cpu_slab(s, thiscpu);
+	l = &c->list;
+
+	slqb_stat_inc(l, FREE);
+
+	if (!NUMA_BUILD || !slab_numa(s) ||
+			likely(slqb_page_to_nid(page) == numa_node_id())) {
+		/*
+		 * Freeing fastpath. Collects all local-node objects, not
+		 * just those allocated from our per-CPU list. This allows
+		 * fast transfer of objects from one CPU to another within
+		 * a given node.
+		 */
+		set_freepointer(s, object, l->freelist.head);
+		l->freelist.head = object;
+		if (!l->freelist.nr)
+			l->freelist.tail = object;
+		l->freelist.nr++;
+
+		if (unlikely(l->freelist.nr > slab_hiwater(s)))
+			flush_free_list(s, l);
+
+	} else {
+#ifdef CONFIG_SMP
+		/*
+		 * Freeing an object that was allocated on a remote node.
+		 */
+		slab_free_to_remote(s, page, object, c);
+		slqb_stat_inc(l, FREE_REMOTE);
+#endif
+	}
+}
+
+/*
+ * Perform some interrupts-on processing around the main freeing path
+ * (debug checking).
+ */
+static __always_inline void slab_free(struct kmem_cache *s,
+				struct slqb_page *page, void *object)
+{
+	unsigned long flags;
+
+	prefetchw(object);
+
+	debug_check_no_locks_freed(object, s->objsize);
+	if (likely(object) && unlikely(slab_debug(s))) {
+		if (unlikely(!free_debug_processing(s, object, _RET_IP_)))
+			return;
+	}
+
+	local_irq_save(flags);
+	__slab_free(s, page, object);
+	local_irq_restore(flags);
+}
+
+void kmem_cache_free(struct kmem_cache *s, void *object)
+{
+	struct slqb_page *page = NULL;
+
+	if (slab_numa(s))
+		page = virt_to_head_slqb_page(object);
+	slab_free(s, page, object);
+}
+EXPORT_SYMBOL(kmem_cache_free);
+
+/*
+ * Calculate the order of allocation given an slab object size.
+ *
+ * Order 0 allocations are preferred since order 0 does not cause fragmentation
+ * in the page allocator, and they have fastpaths in the page allocator. But
+ * also minimise external fragmentation with large objects.
+ */
+static int slab_order(int size, int max_order, int frac)
+{
+	int order;
+
+	if (fls(size - 1) <= PAGE_SHIFT)
+		order = 0;
+	else
+		order = fls(size - 1) - PAGE_SHIFT;
+	if (order < slqb_min_order)
+		order = slqb_min_order;
+
+	while (order <= max_order) {
+		unsigned long slab_size = PAGE_SIZE << order;
+		unsigned long objects;
+		unsigned long waste;
+
+		objects = slab_size / size;
+		if (!objects)
+			goto next;
+
+		if (order < MAX_ORDER && objects < slqb_min_objects) {
+			/*
+			 * if we don't have enough objects for min_objects,
+			 * then try the next size up. Unless we have reached
+			 * our maximum possible page size.
+			 */
+			goto next;
+		}
+
+		waste = slab_size - (objects * size);
+
+		if (waste * frac <= slab_size)
+			break;
+
+next:
+		order++;
+	}
+
+	return order;
+}
+
+static int calculate_order(int size)
+{
+	int order;
+
+	/*
+	 * Attempt to find best configuration for a slab. This
+	 * works by first attempting to generate a layout with
+	 * the best configuration and backing off gradually.
+	 */
+	order = slab_order(size, 1, 4);
+	if (order <= 1)
+		return order;
+
+	/*
+	 * This size cannot fit in order-1. Allow bigger orders, but
+	 * forget about trying to save space.
+	 */
+	order = slab_order(size, MAX_ORDER - 1, 0);
+	if (order < MAX_ORDER)
+		return order;
+
+	return -ENOSYS;
+}
+
+/*
+ * Figure out what the alignment of the objects will be.
+ */
+static unsigned long calculate_alignment(unsigned long flags,
+				unsigned long align, unsigned long size)
+{
+	/*
+	 * If the user wants hardware cache aligned objects then follow that
+	 * suggestion if the object is sufficiently large.
+	 *
+	 * The hardware cache alignment cannot override the specified
+	 * alignment though. If that is greater then use it.
+	 */
+	if (flags & SLAB_HWCACHE_ALIGN) {
+		unsigned long ralign = cache_line_size();
+
+		while (size <= ralign / 2)
+			ralign /= 2;
+		align = max(align, ralign);
+	}
+
+	if (align < ARCH_SLAB_MINALIGN)
+		align = ARCH_SLAB_MINALIGN;
+
+	return ALIGN(align, sizeof(void *));
+}
+
+static void init_kmem_cache_list(struct kmem_cache *s,
+				struct kmem_cache_list *l)
+{
+	l->cache		= s;
+	l->freelist.nr		= 0;
+	l->freelist.head	= NULL;
+	l->freelist.tail	= NULL;
+	l->nr_partial		= 0;
+	l->nr_slabs		= 0;
+	INIT_LIST_HEAD(&l->partial);
+	spin_lock_init(&l->page_lock);
+
+#ifdef CONFIG_SMP
+	l->remote_free_check	= 0;
+	spin_lock_init(&l->remote_free.lock);
+	l->remote_free.list.nr	= 0;
+	l->remote_free.list.head = NULL;
+	l->remote_free.list.tail = NULL;
+#endif
+
+#ifdef CONFIG_SLQB_STATS
+	memset(l->stats, 0, sizeof(l->stats));
+#endif
+}
+
+static void init_kmem_cache_cpu(struct kmem_cache *s,
+				struct kmem_cache_cpu *c)
+{
+	init_kmem_cache_list(s, &c->list);
+
+	c->colour_next		= 0;
+#ifdef CONFIG_SMP
+	c->rlist.nr		= 0;
+	c->rlist.head		= NULL;
+	c->rlist.tail		= NULL;
+	c->remote_cache_list	= NULL;
+#endif
+}
+
+#ifdef CONFIG_NUMA
+static void init_kmem_cache_node(struct kmem_cache *s,
+				struct kmem_cache_node *n)
+{
+	spin_lock_init(&n->list_lock);
+

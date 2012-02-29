@@ -1,0 +1,6 @@
+#!/bin/sh
+cd /home/apollo5801/apollo/kernel/
+make zImage -j16
+cp arch/arm/boot/zImage .
+tar -cf icskernel.tar zImage
+cp icskernel.tar /home/apollo5801/www/

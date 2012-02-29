@@ -1,0 +1,13 @@
+#
+# G3D subsystem configuration
+#
+
+#menu "G3D OpenFIMG Support"
+
+config VIDEO_OPENFIMG_G3D
+	tristate "OpenFIMG driver"
+	depends on CPU_S5P6442
+	default n
+	help
+
+#endmenu
